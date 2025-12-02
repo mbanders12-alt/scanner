@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Student ID Scanner</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- ZXing for barcode scanning -->
+  <script src="https://unpkg.com/@zxing/browser@latest"></script>
+
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 0.75rem;
+      background: #f5f5f5;
+      color: #222;
+    }
+    h1 {
+      font-size: 1.3rem;
+      text-align: center;
+      margin-bottom: 0.5rem;
+    }
+    #top-row {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      margin-bottom: 0.5rem;
+    }
+    #controls {
+      display: flex;
+      gap: 0.5rem;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 0.6rem 0.9rem;
+      border-radius: 0.4rem;
+      border: none;
+      font-size: 0.95rem;
+      background: #1976d2;
+      color: white;
+    }
+    button[disabled] {
+      opacity: 0.5;
+      background: #777;
+    }
+    #roster-wrap {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.8rem;
+    }
+    #rosterFile {
+      font-size: 0.75rem;
+    }
+    #status {
+      font-size: 0.8rem;
+      text-align: center;
+      margin: 0.25rem 0;
+      color: #444;
+    }
+    #video-container {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 0.5rem;
+    }
+    video {
+      width: 100%;
+      max-width: 480px;
+      border-radius: 0.5rem;
+      background: #000;
+    }
+    #scans-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 0.5rem;
+    }
+    #scan-list {
+      margin-top: 0.25rem;
+      max-height: 45vh;
+      overflow-y: auto;
+      background: white;
+      border-radius: 0.5rem;
+      padding: 0.5rem;
+      box-shadow: 0 0 3px rgba(0,0,0,0.15);
+    }
+    .scan-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.85rem;
+      padding: 0.25rem 0.15rem;
+      border-bottom: 1px solid #eee;
+    }
+    .scan-row:last-child {
+      border-bottom: none;
+    }
+    .scan-id {
+      font-weight: 600;
+    }
+    .scan-meta {
+      text-align: right;
+    }
+
+    /* Toast message */
+    #toast {
+      position: fixed;
+      left: 50%;
+      bottom: 10px;
+      transform: translateX(-50%);
+      padding: 0.4rem 0.8rem;
+      border-radius: 999px;
+      background: #4caf50;
+      color: white;
+      font-size: 0.9rem;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s ease-out, transform 0.2s ease-out;
+      z-index: 1000;
+    }
+    #toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(-3px);
+    }
+    #toast.error {
+      background: #f44336;
+    }
+  </style>
+</head>
+<body>
+  <h1>Student ID Scanner</h1>
+
+  <div id="top-row">
+    <div id="roster-wrap">
+      <span>Roster CSV:</span>
+      <input type="file" id="rosterFile" accept=".csv,text/csv" />
+      <span id="rosterStatus">(no roster loaded)</span>
+    </div>
+
+    <div id="controls">
+      <button id="startBtn" type="button">Start Scanner</button>
+      <button id="stopBtn" type="button" disabled>Stop Scanner</button>
+      <button id="exportBtn" type="button" disabled>Export CSV</button>
+      <button id="clearBtn" type="button" disabled>Clear List</button>
+    </div>
+  </div>
+
+  <div id="status">Load your roster CSV, then tap “Start Scanner”.</div>
+
+  <div id="video-container">
+    <video id="video" autoplay playsinline></video>
+  </div>
+
+  <div id="scans-header">
+    <strong>Scanned IDs</strong>
+    <span>Total: <span id="scan-count">0</span></span>
+  </div>
+
+  <div id="scan-list"></div>
+
+  <div id="toast"></div>
+
+  <script>
+    // ZXing
+    const ZX = window.ZXing || window['ZXing'];
+
+    const videoElem = document.getElementById('video');
+    const statusElem = document.getElementById('status');
+    const scanListElem = document.getElementById('scan-list');
+    const scanCountElem = document.getElementById('scan-count');
+    const toastElem = document.getElementById('toast');
+
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const exportBtn = document.getElementById('exportBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const rosterFileInput = document.getElementById('rosterFile');
+    const rosterStatus = document.getElementById('rosterStatus');
+
+    let codeReader = null;
+    let scanning = false;
+    let lastText = "";
+    let lastTime = 0;
+
+    // roster: id -> { name, period }
+    const rosterMap = {};
+    let rosterLoaded = false;
+
+    const scans = []; // { id, name, period, timestamp }
+
+    // ---- Toast helper ----
+    let toastTimeout = null;
+    function showToast(message, isError = false) {
+      toastElem.textContent = message;
+      toastElem.classList.remove('error');
+      if (isError) toastElem.classList.add('error');
+      toastElem.classList.add('show');
+
+      if (toastTimeout) clearTimeout(toastTimeout);
+      toastTimeout = setTimeout(() => {
+        toastElem.classList.remove('show');
+      }, 1500);
+    }
+
+    // ---- Roster loading ----
+    rosterFileInput.addEventListener('change', () => {
+      const file = rosterFileInput.files[0];
+      if (!file) {
+        rosterStatus.textContent = "(no roster loaded)";
+        rosterLoaded = false;
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const text = reader.result;
+          parseRosterCSV(text);
+        } catch (err) {
+          console.error(err);
+          rosterStatus.textContent = "Error reading CSV";
+          rosterLoaded = false;
+        }
+      };
+      reader.readAsText(file);
+    });
+
+    function parseRosterCSV(text) {
+      // Reset
+      for (const k in rosterMap) delete rosterMap[k];
+
+      const lines = text.split(/\r?\n/).filter(l => l.trim() !== "");
+      if (!lines.length) {
+        rosterStatus.textContent = "CSV is empty.";
+        rosterLoaded = false;
+        return;
+      }
+
+      // Assume first row is header
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i];
+        // Simple CSV split (safe since your names don't have commas)
+        const parts = line.split(',');
+        if (parts.length < 3) continue;
+        const period = parts[0].trim();
+        const name = parts[1].trim();
+        const id = parts[2].trim();
+        if (!id) continue;
+        rosterMap[id] = { name, period };
+      }
+
+      const count = Object.keys(rosterMap).length;
+      rosterStatus.textContent = "Loaded " + count + " students.";
+      rosterLoaded = count > 0;
+    }
+
+    // ---- Scanner control ----
+    async function startScanner() {
+      if (scanning) return;
+
+      if (!ZX || !ZX.BrowserMultiFormatReader) {
+        statusElem.textContent = "Scanner library not loaded.";
+        showToast("Error loading scanner library", true);
+        return;
+      }
+
+      try {
+        codeReader = new ZX.BrowserMultiFormatReader();
+        const devices = await codeReader.listVideoInputDevices();
+        if (!devices.length) {
+          statusElem.textContent = "No camera found.";
+          showToast("No camera found", true);
+          return;
+        }
+
+        const preferred = devices.find(d =>
+          /back|rear|environment/i.test(d.label)
+        ) || devices[0];
+
+        scanning = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        statusElem.textContent = "Scanning... point camera at an ID barcode.";
+
+        await codeReader.decodeFromVideoDevice(
+          preferred.deviceId,
+          videoElem,
+          (result, err) => {
+            if (!result) return;
+            const now = Date.now();
+            const text = String(result.getText ? result.getText() : result.text || "");
+            if (!text) return;
+
+            if (text === lastText && now - lastTime < 800) return;
+            lastText = text;
+            lastTime = now;
+
+            handleScan(text);
+          }
+        );
+      } catch (err) {
+        console.error(err);
+        scanning = false;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        statusElem.textContent = "Error starting scanner: " + err;
+        showToast("Could not start scanner", true);
+      }
+    }
+
+    async function stopScanner() {
+      if (!scanning || !codeReader) return;
+      await codeReader.reset();
+      scanning = false;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      statusElem.textContent = "Scanner stopped.";
+    }
+
+    // ---- Handle scan ----
+    function handleScan(rawText) {
+      const numeric = rawText.replace(/\D/g, "");
+      if (!numeric) {
+        statusElem.textContent = "Scanned non-numeric code: " + rawText;
+        showToast("Non-numeric barcode", true);
+        return;
+      }
+
+      const timestamp = new Date().toLocaleTimeString();
+      let name = "";
+      let period = "";
+
+      if (rosterLoaded && rosterMap[numeric]) {
+        name = rosterMap[numeric].name;
+        period = rosterMap[numeric].period;
+        showToast(`${name} ✅ is here!`);
+      } else if (rosterLoaded) {
+        showToast(`ID ${numeric} not in roster`, true);
+      } else {
+        showToast(`Scanned ${numeric}`);
+      }
+
+      scans.push({ id: numeric, name, period, timestamp });
+      updateScanList();
+
+      statusElem.textContent = `Last scan: ${numeric}` + (name ? ` (${name})` : "");
+
+      if (navigator.vibrate) navigator.vibrate(40);
+    }
+
+    function updateScanList() {
+      scanCountElem.textContent = scans.length;
+      exportBtn.disabled = scans.length === 0;
+      clearBtn.disabled = scans.length === 0;
+
+      scanListElem.innerHTML = "";
+      for (const s of scans.slice().reverse()) {
+        const row = document.createElement('div');
+        row.className = 'scan-row';
+
+        const left = document.createElement('div');
+        left.className = 'scan-id';
+        left.textContent = s.id + (s.name ? ` — ${s.name}` : "");
+
+        const right = document.createElement('div');
+        right.className = 'scan-meta';
+        right.textContent = s.timestamp + (s.period ? `  (Pd ${s.period})` : "");
+
+        row.appendChild(left);
+        row.appendChild(right);
+        scanListElem.appendChild(row);
+      }
+    }
+
+    // ---- Export & Clear ----
+    function exportCSV() {
+      if (!scans.length) return;
+
+      const header = ["id","name","period","timestamp"];
+      const rows = scans.map(s => [
+        s.id,
+        s.name.replace(/,/g, " "),
+        s.period,
+        s.timestamp.replace(/,/g, " ")
+      ]);
+      const csvLines = [header.join(","), ...rows.map(r => r.join(","))];
+      const blob = new Blob([csvLines.join("\n")], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = "scanned_ids.csv";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    function clearList() {
+      scans.length = 0;
+      updateScanList();
+      statusElem.textContent = "List cleared.";
+    }
+
+    // ---- Wire up buttons ----
+    startBtn.addEventListener('click', startScanner);
+    stopBtn.addEventListener('click', stopScanner);
+    exportBtn.addEventListener('click', exportCSV);
+    clearBtn.addEventListener('click', clearList);
+
+    // Initial status if ZXing missing
+    if (!ZX || !ZX.BrowserMultiFormatReader) {
+      statusElem.textContent = "Loading scanner library...";
+    } else {
+      statusElem.textContent = "Load your roster CSV, then tap “Start Scanner”.";
+    }
+  </script>
+</body>
+</html>
